@@ -293,7 +293,8 @@ static void on_request(evhttp_request *req, void *args)
         evhttp_send_reply(req, response.status_code, nullptr, output_buffer);
         break;
     case -1: //not found
-        return_data = "File not found.";
+        return_data = "File not found.\n"
+                      "未找到文件。";
         evbuffer_add(output_buffer, return_data.data(), return_data.size());
         evhttp_send_reply(req, HTTP_NOTFOUND, nullptr, output_buffer);
         //evhttp_send_error(req, HTTP_NOTFOUND, "Resource not found");
