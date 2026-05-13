@@ -2133,7 +2133,11 @@ std::string renderTemplate(RESPONSE_CALLBACK_ARGS) {
       fetchFile(path, parseProxy(global.proxyConfig), global.cacheConfig);
   if (template_content.empty()) {
     *status_code = 400;
-    return "File empty or out of scope";
+    return "Invalid template: file is empty or cannot be read within the "
+           "allowed scope.\n"
+           "无效模板：文件为空，或无法在允许范围内读取。\n"
+           "Please check the template content and configured template path.\n"
+           "请检查模板内容和已配置的模板路径。";
   }
   template_args tpl_args;
   tpl_args.global_vars = global.templateVars;
