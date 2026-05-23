@@ -6,6 +6,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <cstdint>
 
 #include <curl/curl.h>
 
@@ -15,6 +16,7 @@
 #include "utils/file_extra.h"
 #include "utils/lock.h"
 #include "utils/logger.h"
+#include "utils/network.h"
 #include "utils/urlencode.h"
 #include "version.h"
 #include "webget.h"
@@ -203,6 +205,153 @@ static bool build_jsdelivr_github_url(const std::string &url,
     return true;
 }
 
+static bool parse_ipv4_address(const std::string &address, uint32_t &value)
+{
+    if(!isIPv4(address))
+        return false;
+    string_array octets = split(address, ".");
+    if(octets.size() != 4)
+        return false;
+    value = 0;
+    for(const std::string &octet : octets)
+    {
+        int part = to_int(octet, -1);
+        if(part < 0 || part > 255)
+            return false;
+        value = (value << 8) | static_cast<uint32_t>(part);
+    }
+    return true;
+}
+
+static bool ipv4_in_cidr(uint32_t address, uint32_t network, unsigned int bits)
+{
+    uint32_t mask = bits == 0 ? 0 : (0xffffffffu << (32 - bits));
+    return (address & mask) == network;
+}
+
+static bool is_blocked_ipv4(const std::string &address)
+{
+    uint32_t ip = 0;
+    if(!parse_ipv4_address(address, ip))
+        return false;
+
+    return ipv4_in_cidr(ip, 0x00000000u, 8) ||     // 0.0.0.0/8
+           ipv4_in_cidr(ip, 0x0a000000u, 8) ||     // 10.0.0.0/8
+           ipv4_in_cidr(ip, 0x64400000u, 10) ||    // 100.64.0.0/10
+           ipv4_in_cidr(ip, 0x7f000000u, 8) ||     // 127.0.0.0/8
+           ipv4_in_cidr(ip, 0xa9fe0000u, 16) ||    // 169.254.0.0/16
+           ipv4_in_cidr(ip, 0xac100000u, 12) ||    // 172.16.0.0/12
+           ipv4_in_cidr(ip, 0xc0a80000u, 16) ||    // 192.168.0.0/16
+           ipv4_in_cidr(ip, 0xc6120000u, 15) ||    // 198.18.0.0/15
+           ipv4_in_cidr(ip, 0xe0000000u, 4) ||     // 224.0.0.0/4
+           ipv4_in_cidr(ip, 0xf0000000u, 4) ||     // 240.0.0.0/4
+           ip == 0xffffffffu;
+}
+
+static bool is_fake_ipv4(const std::string &address)
+{
+    uint32_t ip = 0;
+    return parse_ipv4_address(address, ip) && ipv4_in_cidr(ip, 0xc6120000u, 15);
+}
+
+static bool is_blocked_ipv6(const std::string &address)
+{
+    std::string value = toLower(trimWhitespace(address, true, true));
+    if(value == "::" || value == "::1")
+        return true;
+    if(startsWith(value, "fe80:") || startsWith(value, "fe80::"))
+        return true;
+    if(value.size() >= 2 && value[0] == 'f' &&
+       (value[1] == 'c' || value[1] == 'd'))
+        return true;
+    std::string::size_type mapped = value.rfind(':');
+    if(mapped != std::string::npos)
+        return is_blocked_ipv4(value.substr(mapped + 1));
+    return false;
+}
+
+static bool is_blocked_ip_address(const std::string &address,
+                                  bool allow_fake_ip = false)
+{
+    if(allow_fake_ip && is_fake_ipv4(address))
+        return false;
+    return is_blocked_ipv4(address) || is_blocked_ipv6(address);
+}
+
+static std::string normalize_fetch_host(std::string host)
+{
+    host = toLower(trimWhitespace(host, true, true));
+    while(!host.empty() && host.back() == '.')
+        host.pop_back();
+    return host;
+}
+
+static bool is_blocked_hostname(const std::string &host)
+{
+    if(host == "localhost" || endsWith(host, ".localhost"))
+        return true;
+    if(endsWith(host, ".local") || endsWith(host, ".localdomain") ||
+       endsWith(host, ".home.arpa"))
+        return true;
+    return false;
+}
+
+bool isFetchUrlAllowed(const std::string &url, FetchContext context)
+{
+    if(!isPublicFetchRestricted(context))
+        return true;
+    if(startsWith(url, "data:"))
+        return true;
+    if(!startsWith(url, "http://") && !startsWith(url, "https://"))
+    {
+        writeLog(0, "已阻止公开请求获取不支持协议的 URL：" + url,
+                 LOG_LEVEL_WARNING);
+        return false;
+    }
+
+    std::string parsed_url = url, host, path;
+    int port = 0;
+    bool is_tls = false;
+    urlParse(parsed_url, host, path, port, is_tls);
+    host = normalize_fetch_host(host);
+    if(host.empty() || is_blocked_hostname(host) || is_blocked_ip_address(host))
+    {
+        writeLog(0, "已阻止公开请求访问本地或私有主机：" + url,
+                 LOG_LEVEL_WARNING);
+        return false;
+    }
+
+    std::string resolved = hostnameToIPAddr(host);
+    if(!resolved.empty() && is_blocked_ip_address(resolved, true))
+    {
+        writeLog(0,
+                 "已阻止公开请求：目标主机解析到本地或私有地址：" + url,
+                 LOG_LEVEL_WARNING);
+        return false;
+    }
+    return true;
+}
+
+#if LIBCURL_VERSION_NUM >= 0x075000
+static int public_fetch_prereq_callback(void *clientp, char *conn_primary_ip,
+                                        char *conn_local_ip,
+                                        int conn_primary_port,
+                                        int conn_local_port)
+{
+    FetchContext *context = static_cast<FetchContext *>(clientp);
+    if(context && isPublicFetchRestricted(*context) && conn_primary_ip &&
+       is_blocked_ip_address(conn_primary_ip, true))
+    {
+        writeLog(0,
+                 "已阻止公开请求连接本地或私有地址：" +
+                     std::string(conn_primary_ip),
+                 LOG_LEVEL_WARNING);
+        return CURL_PREREQFUNC_ABORT;
+    }
+    return CURL_PREREQFUNC_OK;
+}
+#endif
+
 static bool should_try_jsdelivr_fallback(CURLcode ret_code, int status_code)
 {
     if(ret_code != CURLE_OK)
@@ -273,13 +422,13 @@ static int logger(CURL *handle, curl_infotype type, char *data, size_t size, voi
     switch(type)
     {
     case CURLINFO_TEXT:
-        prefix = "CURL_INFO: ";
+        prefix = "CURL 信息：";
         break;
     case CURLINFO_HEADER_IN:
-        prefix = "CURL_HEADER: < ";
+        prefix = "CURL 响应头：< ";
         break;
     case CURLINFO_HEADER_OUT:
-        prefix = "CURL_HEADER: > ";
+        prefix = "CURL 请求头：> ";
         break;
     case CURLINFO_DATA_IN:
     case CURLINFO_DATA_OUT:
@@ -343,7 +492,7 @@ static int curlGet(const FetchArgument &argument, FetchResult &result, CURLcode 
         *result.status_code = 0;
         if(return_code)
             *return_code = retVal;
-        writeLog(0, "curl_global_init failed: " + std::string(curl_easy_strerror(retVal)), LOG_LEVEL_ERROR);
+        writeLog(0, "curl_global_init 失败：" + std::string(curl_easy_strerror(retVal)), LOG_LEVEL_ERROR);
         return 0;
     }
 
@@ -354,14 +503,14 @@ static int curlGet(const FetchArgument &argument, FetchResult &result, CURLcode 
         *result.status_code = 0;
         if(return_code)
             *return_code = retVal;
-        writeLog(0, "curl_easy_init failed.", LOG_LEVEL_ERROR);
+        writeLog(0, "curl_easy_init 失败。", LOG_LEVEL_ERROR);
         return 0;
     }
     if(!argument.proxy.empty())
     {
         if(startsWith(argument.proxy, "cors:"))
         {
-            header_list = curl_slist_append(header_list, "X-Requested-With: subconverter " VERSION);
+            header_list = curl_slist_append(header_list, "X-Requested-With: SubConverter-Extended " VERSION);
             new_url = argument.proxy.substr(5) + argument.url;
         }
         else
@@ -370,6 +519,15 @@ static int curlGet(const FetchArgument &argument, FetchResult &result, CURLcode 
     curl_progress_data limit;
     limit.size_limit = global.maxAllowedDownloadSize;
     curl_set_common_options(curl_handle, new_url.data(), &limit);
+#if LIBCURL_VERSION_NUM >= 0x075000
+    FetchContext prereq_context = argument.context;
+    if(isPublicFetchRestricted(argument.context) && argument.proxy.empty())
+    {
+        curl_easy_setopt(curl_handle, CURLOPT_PREREQFUNCTION,
+                         public_fetch_prereq_callback);
+        curl_easy_setopt(curl_handle, CURLOPT_PREREQDATA, &prereq_context);
+    }
+#endif
     header_list = curl_slist_append(header_list, "Content-Type: application/json;charset=utf-8");
     if(argument.request_headers)
     {
@@ -497,7 +655,7 @@ static int curlGetWithGitHubFallback(const FetchArgument &argument, FetchResult 
         original_cookies = *result.cookies;
 
     writeLog(0,
-             "GitHub raw fetch failed, trying jsDelivr fallback: " +
+             "GitHub Raw 获取失败，正在尝试 jsDelivr 回退源：" +
                  fallback_url,
              LOG_LEVEL_WARNING);
     clear_fetch_output(result);
@@ -505,20 +663,21 @@ static int curlGetWithGitHubFallback(const FetchArgument &argument, FetchResult 
     FetchArgument fallback_argument {HTTP_GET, fallback_url, argument.proxy,
                                      nullptr, argument.request_headers,
                                      argument.cookies, argument.cache_ttl,
-                                     argument.keep_resp_on_fail};
+                                     argument.keep_resp_on_fail,
+                                     argument.context};
     CURLcode fallback_code = CURLE_OK;
     int fallback_status = curlGet(fallback_argument, result, &fallback_code);
     if(fallback_code == CURLE_OK && fallback_status == 200)
     {
         writeLog(0,
-                 "GitHub raw fallback succeeded via jsDelivr: " +
+                 "GitHub Raw 已通过 jsDelivr 回退源获取成功：" +
                      fallback_url,
                  LOG_LEVEL_INFO);
         return fallback_status;
     }
 
     writeLog(0,
-             "GitHub raw fallback failed via jsDelivr: " + fallback_url,
+             "GitHub Raw 通过 jsDelivr 回退源获取失败：" + fallback_url,
              LOG_LEVEL_WARNING);
     clear_fetch_output(result);
     if(result.response_headers)
@@ -539,8 +698,23 @@ static std::string dataGet(const std::string &url)
         return "";
 
     std::string data = urlDecode(url.substr(comma + 1));
+    if (global.maxAllowedDownloadSize > 0 &&
+        data.size() > static_cast<size_t>(global.maxAllowedDownloadSize)) {
+        writeLog(0, "已阻止 data URL：内容超过最大下载大小。",
+                 LOG_LEVEL_WARNING);
+        return "";
+    }
     if (endsWith(url.substr(0, comma), ";base64")) {
-        return urlSafeBase64Decode(data);
+        std::string decoded = urlSafeBase64Decode(data);
+        if (global.maxAllowedDownloadSize > 0 &&
+            decoded.size() >
+                static_cast<size_t>(global.maxAllowedDownloadSize)) {
+            writeLog(0,
+                     "已阻止解码后的 data URL：内容超过最大下载大小。",
+                     LOG_LEVEL_WARNING);
+            return "";
+        }
+        return decoded;
     } else {
         return data;
     }
@@ -553,12 +727,16 @@ std::string buildSocks5ProxyString(const std::string &addr, int port, const std:
     return proxystr;
 }
 
-std::string webGet(const std::string &url, const std::string &proxy, unsigned int cache_ttl, std::string *response_headers, string_icase_map *request_headers)
+std::string webGet(const std::string &url, const std::string &proxy, unsigned int cache_ttl, std::string *response_headers, string_icase_map *request_headers, FetchContext context)
 {
     int return_code = 0;
     std::string content;
 
-    FetchArgument argument {HTTP_GET, url, proxy, nullptr, request_headers, nullptr, cache_ttl};
+    if (!isFetchUrlAllowed(url, context))
+        return "";
+
+    FetchArgument argument {HTTP_GET, url, proxy, nullptr, request_headers,
+                            nullptr, cache_ttl, false, context};
     FetchResult fetch_res {&return_code, &content, response_headers, nullptr};
 
     if (startsWith(url, "data:"))
@@ -576,7 +754,7 @@ std::string webGet(const std::string &url, const std::string &proxy, unsigned in
             if(difftime(now, mtime) <= cache_ttl) // within TTL
             {
                 if(shouldLog(LOG_LEVEL_VERBOSE))
-                    writeLog(0, "CACHE HIT: '" + url + "', using local cache.");
+                    writeLog(0, "缓存命中：'" + url + "'，使用本地缓存。");
                 //guarded_mutex guard(cache_rw_lock);
                 cache_rw_lock.readLock();
                 defer(cache_rw_lock.readUnlock();)
@@ -585,12 +763,12 @@ std::string webGet(const std::string &url, const std::string &proxy, unsigned in
                 return fileGet(path, true);
             }
             if(shouldLog(LOG_LEVEL_VERBOSE))
-                writeLog(0, "CACHE MISS: '" + url + "', TTL timeout, creating new cache."); // out of TTL
+                writeLog(0, "缓存过期：'" + url + "'，正在创建新缓存。"); // out of TTL
         }
         else
         {
             if(shouldLog(LOG_LEVEL_VERBOSE))
-                writeLog(0, "CACHE NOT EXIST: '" + url + "', creating new cache.");
+                writeLog(0, "缓存不存在：'" + url + "'，正在创建新缓存。");
         }
         std::shared_future<CacheFetchResult> fetch_future;
         bool owner = false;
@@ -635,7 +813,7 @@ std::string webGet(const std::string &url, const std::string &proxy, unsigned in
             if(fileExist(path) && global.serveCacheOnFetchFail) // failed, check if cache exist
             {
                 if(shouldLog(LOG_LEVEL_VERBOSE))
-                    writeLog(0, "Fetch failed. Serving cached content."); // cache exist, serving cache
+                    writeLog(0, "获取失败，返回缓存内容。"); // cache exist, serving cache
                 //guarded_mutex guard(cache_rw_lock);
                 cache_rw_lock.readLock();
                 defer(cache_rw_lock.readUnlock();)
@@ -646,7 +824,7 @@ std::string webGet(const std::string &url, const std::string &proxy, unsigned in
             else
             {
                 if(shouldLog(LOG_LEVEL_VERBOSE))
-                    writeLog(0, "Fetch failed. No local cache available."); // cache not exist or not allow to serve cache, serving nothing
+                    writeLog(0, "获取失败，且没有可用的本地缓存。"); // cache not exist or not allow to serve cache, serving nothing
             }
         }
         if(owner)
@@ -706,5 +884,17 @@ string_array headers_map_to_array(const string_map &headers)
 
 int webGet(const FetchArgument& argument, FetchResult &result)
 {
+    if (!isFetchUrlAllowed(argument.url, argument.context)) {
+        *result.status_code = 403;
+        if (result.content)
+            result.content->clear();
+        return 403;
+    }
+    if (startsWith(argument.url, "data:")) {
+        if (result.content)
+            *result.content = dataGet(argument.url);
+        *result.status_code = result.content && !result.content->empty() ? 200 : 400;
+        return *result.status_code;
+    }
     return curlGetWithGitHubFallback(argument, result);
 }

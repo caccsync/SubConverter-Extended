@@ -1,8 +1,13 @@
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <ctime>
+#include <exception>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 
@@ -16,11 +21,13 @@
 #include "generator/template/templates.h"
 #include "interfaces.h"
 #include "multithread.h"
+#include "parser/mihomo_scheme_utils.h"
 #include "script/cron.h"
 #include "script/script_quickjs.h"
 #include "server/webserver.h"
 #include "settings.h"
 #include "upload.h"
+#include "utils/time_compat.h"
 
 // Multiple CDN fallback URLs for default external config
 // Will be tried in order if user-provided config fails to load
@@ -169,16 +176,18 @@ std::string getRuleset(RESPONSE_CALLBACK_ARGS) {
   if (url.empty() || type.empty() || (type_int == 2 && group.empty()) ||
       (type_int < 1 || type_int > 6)) {
     *status_code = 400;
-    return "Invalid request!";
+    return "Invalid request: missing or invalid ruleset parameters.\n"
+           "无效请求：规则集参数缺失或无效。\n"
+           "Required: url and type=1..6; group is required when type=2.\n"
+           "必须提供 url 和 type=1..6；当 type=2 时还必须提供 group。";
   }
 
-  std::string proxy = parseProxy(global.proxyRuleset);
   string_array vArray = split(url, "|");
   for (std::string &x : vArray)
     x.insert(0, "ruleset,");
   std::vector<RulesetContent> rca;
   RulesetConfigs confs = INIBinding::from<RulesetConfig>::from_ini(vArray);
-  refreshRulesets(confs, rca);
+  refreshRulesets(confs, rca, FetchContext::PublicRequest);
   for (RulesetContent &x : rca) {
     std::string content = x.rule_content.get();
     output_content += convertRuleset(content, x.rule_type);
@@ -186,7 +195,12 @@ std::string getRuleset(RESPONSE_CALLBACK_ARGS) {
 
   if (output_content.empty()) {
     *status_code = 400;
-    return "Invalid request!";
+    return "Invalid request: no valid rules were found in the supplied "
+           "ruleset source.\n"
+           "无效请求：提供的规则集来源中未找到有效规则。\n"
+           "Please check whether the URL is reachable and the ruleset type "
+           "matches the content.\n"
+           "请检查链接是否可访问，以及规则集类型是否与内容匹配。";
   }
 
   std::string strLine;
@@ -320,9 +334,21 @@ std::string getRuleset(RESPONSE_CALLBACK_ARGS) {
   return output_content;
 }
 
-void checkExternalBase(const std::string &path, std::string &dest) {
-  if (isLink(path) || (startsWith(path, global.basePath) && fileExist(path)))
+bool checkExternalBase(const std::string &path, std::string &dest,
+                       FetchContext context) {
+  if (path.empty())
+    return false;
+  if (isLink(path)) {
+    if (!isFetchUrlAllowed(path, context))
+      return false;
     dest = path;
+    return true;
+  }
+  if (fileExist(path, true) && isTrustedLocalResourcePath(path)) {
+    dest = path;
+    return true;
+  }
+  return false;
 }
 
 static bool hasEffectiveExternalConfig(const ExternalConfig &extconf,
@@ -584,8 +610,264 @@ static std::string sanitizeProviderName(const std::string &input) {
   return cleaned;
 }
 
+static std::string subconverter_impl(RESPONSE_CALLBACK_ARGS);
+
+namespace {
+
+struct CoalescedResponse {
+  int status_code = 200;
+  std::string content_type;
+  string_icase_map headers;
+  std::string body;
+};
+
+struct InflightSubRequest {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool done = false;
+  CoalescedResponse result;
+  std::exception_ptr exception;
+};
+
+struct CachedSubResponse {
+  CoalescedResponse result;
+  std::chrono::steady_clock::time_point expires_at;
+};
+
+static std::mutex g_sub_inflight_mutex;
+static std::map<std::string, std::shared_ptr<InflightSubRequest>>
+    g_sub_inflight;
+static std::mutex g_sub_response_cache_mutex;
+static std::map<std::string, CachedSubResponse> g_sub_response_cache;
+
+static bool isTruthyRequestValue(const std::string &value) {
+  std::string normalized = toLower(trimWhitespace(value, true, true));
+  return normalized == "1" || normalized == "true" ||
+         normalized == "yes" || normalized == "on";
+}
+
+static bool appendKeyPart(std::string &identity, const std::string &name,
+                          const std::string &value) {
+  static constexpr size_t kMaxIdentitySize = 2 * 1024 * 1024;
+  size_t extra_size = name.size() + value.size() + 32;
+  if (identity.size() + extra_size > kMaxIdentitySize)
+    return false;
+  identity += name;
+  identity += ':';
+  identity += std::to_string(value.size());
+  identity += ':';
+  identity += value;
+  identity += '\n';
+  return true;
+}
+
+static bool shouldCoalesceSubRequest(const Request &request) {
+  if (!global.enableRequestCoalescing)
+    return false;
+  if (request.method != "GET" || request.url != "/sub")
+    return false;
+  if (isTruthyRequestValue(getUrlArg(request.argument, "upload")))
+    return false;
+  return true;
+}
+
+static std::string buildSubRequestKey(const Request &request) {
+  std::string identity;
+  if (!appendKeyPart(identity, "version", VERSION) ||
+      !appendKeyPart(identity, "config_generation",
+                     std::to_string(global.configGeneration)) ||
+      !appendKeyPart(identity, "managed_config_prefix",
+                     global.managedConfigPrefix) ||
+      !appendKeyPart(identity, "method", request.method) ||
+      !appendKeyPart(identity, "path", request.url))
+    return "";
+
+  for (const auto &arg : request.argument) {
+    if (!appendKeyPart(identity, "arg_name", arg.first) ||
+        !appendKeyPart(identity, "arg_value", arg.second))
+      return "";
+  }
+
+  for (const auto &header : request.headers) {
+    if (!appendKeyPart(identity, "header_name", toLower(header.first)) ||
+        !appendKeyPart(identity, "header_value", header.second))
+      return "";
+  }
+
+  return getMD5(identity);
+}
+
+static void copyCoalescedToResponse(const CoalescedResponse &result,
+                                    Response &response) {
+  response.status_code = result.status_code;
+  response.content_type = result.content_type;
+  response.headers = result.headers;
+}
+
+static CoalescedResponse makeCoalescedResult(const std::string &body,
+                                             const Response &response) {
+  CoalescedResponse result;
+  result.status_code = response.status_code;
+  result.content_type = response.content_type;
+  result.headers = response.headers;
+  result.body = body;
+  return result;
+}
+
+static void pruneExpiredSubResponseCache(
+    std::chrono::steady_clock::time_point now) {
+  for (auto iter = g_sub_response_cache.begin();
+       iter != g_sub_response_cache.end();) {
+    if (iter->second.expires_at <= now)
+      iter = g_sub_response_cache.erase(iter);
+    else
+      ++iter;
+  }
+}
+
+static bool getCachedSubResponse(const std::string &key,
+                                 CoalescedResponse &result) {
+  if (global.responseCacheTtl <= 0)
+    return false;
+
+  auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(g_sub_response_cache_mutex);
+  auto iter = g_sub_response_cache.find(key);
+  if (iter == g_sub_response_cache.end())
+    return false;
+  if (iter->second.expires_at <= now) {
+    g_sub_response_cache.erase(iter);
+    return false;
+  }
+  result = iter->second.result;
+  return true;
+}
+
+static void storeCachedSubResponse(const std::string &key,
+                                   const CoalescedResponse &result) {
+  if (global.responseCacheTtl <= 0 || result.status_code != 200)
+    return;
+
+  int ttl = std::min(global.responseCacheTtl, 5);
+  if (ttl <= 0)
+    return;
+
+  auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(g_sub_response_cache_mutex);
+  pruneExpiredSubResponseCache(now);
+  if (g_sub_response_cache.size() > 2048) {
+    writeLog(0,
+             "响应微缓存条目数量过多，已清空以避免占用过多内存。",
+             LOG_LEVEL_WARNING);
+    g_sub_response_cache.clear();
+  }
+  g_sub_response_cache[key] = {
+      result, now + std::chrono::seconds(ttl)};
+}
+
+static std::string runSubconverterImplWithRetry(const Request &original,
+                                                Response &response) {
+  Request first_request = original;
+  Response first_response;
+  std::string body = subconverter_impl(first_request, first_response);
+  if (first_response.status_code < 500 || !global.coalesceRetryOn5xx) {
+    response = first_response;
+    return body;
+  }
+
+  writeLog(0,
+           "/sub 请求首次转换返回 5xx，正在进行一次服务端内部重试。",
+           LOG_LEVEL_WARNING);
+  Request retry_request = original;
+  Response retry_response;
+  std::string retry_body = subconverter_impl(retry_request, retry_response);
+  if (retry_response.status_code < 500) {
+    response = retry_response;
+    return retry_body;
+  }
+
+  response = first_response;
+  return body;
+}
+
+} // namespace
 
 std::string subconverter(RESPONSE_CALLBACK_ARGS) {
+  if (!shouldCoalesceSubRequest(request))
+    return subconverter_impl(request, response);
+
+  std::string key = buildSubRequestKey(request);
+  if (key.empty())
+    return subconverter_impl(request, response);
+
+  CoalescedResponse cached_result;
+  if (getCachedSubResponse(key, cached_result)) {
+    writeLog(0, "/sub 响应微缓存命中。", LOG_LEVEL_DEBUG);
+    copyCoalescedToResponse(cached_result, response);
+    return cached_result.body;
+  }
+
+  std::shared_ptr<InflightSubRequest> call;
+  bool owner = false;
+  {
+    std::lock_guard<std::mutex> lock(g_sub_inflight_mutex);
+    auto iter = g_sub_inflight.find(key);
+    if (iter == g_sub_inflight.end()) {
+      call = std::make_shared<InflightSubRequest>();
+      g_sub_inflight.emplace(key, call);
+      owner = true;
+    } else {
+      call = iter->second;
+    }
+  }
+
+  if (!owner) {
+    writeLog(0, "/sub 请求已合并到正在执行的同 key 转换。",
+             LOG_LEVEL_DEBUG);
+    std::unique_lock<std::mutex> lock(call->mutex);
+    call->cv.wait(lock, [&call] { return call->done; });
+    if (call->exception)
+      std::rethrow_exception(call->exception);
+    copyCoalescedToResponse(call->result, response);
+    return call->result.body;
+  }
+
+  try {
+    writeLog(0, "/sub 请求成为同 key 转换 owner。", LOG_LEVEL_DEBUG);
+    Request original_request = request;
+    Response owner_response;
+    std::string body =
+        runSubconverterImplWithRetry(original_request, owner_response);
+    CoalescedResponse result = makeCoalescedResult(body, owner_response);
+    response = owner_response;
+    {
+      std::lock_guard<std::mutex> lock(call->mutex);
+      call->result = result;
+      call->done = true;
+    }
+    {
+      std::lock_guard<std::mutex> lock(g_sub_inflight_mutex);
+      g_sub_inflight.erase(key);
+    }
+    storeCachedSubResponse(key, result);
+    call->cv.notify_all();
+    return body;
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> lock(call->mutex);
+      call->exception = std::current_exception();
+      call->done = true;
+    }
+    {
+      std::lock_guard<std::mutex> lock(g_sub_inflight_mutex);
+      g_sub_inflight.erase(key);
+    }
+    call->cv.notify_all();
+    throw;
+  }
+}
+
+static std::string subconverter_impl(RESPONSE_CALLBACK_ARGS) {
   auto &argument = request.argument;
   int *status_code = &response.status_code;
 
@@ -621,7 +903,14 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
     break;
   default:
     *status_code = 400;
-    return "Invalid target!";
+    return "Invalid request: unsupported target value.\n"
+           "无效请求：不支持的 target 参数值。\n"
+           "Supported targets: clash, clashr, surge, quan, quanx, loon, "
+           "surfboard, mellow, singbox, ss, ssd, ssr, sssub, v2ray, trojan, "
+           "mixed.\n"
+           "支持的 target：clash、clashr、surge、quan、quanx、loon、"
+           "surfboard、mellow、singbox、ss、ssd、ssr、sssub、v2ray、trojan、"
+           "mixed。";
   }
   // check if we need to read configuration
   if (global.reloadConfOnRequest &&
@@ -665,7 +954,8 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
           argAppendUserinfo = getUrlArg(argument, "append_info");
   tribool argPrependInsert = getUrlArg(argument, "prepend"),
           argGenClassicalRuleProvider = getUrlArg(argument, "classic"),
-          argTLS13 = getUrlArg(argument, "tls13");
+          argTLS13 = getUrlArg(argument, "tls13"),
+          argProviderProxyDirect = getUrlArg(argument, "provider_proxy_direct");
 
   std::string base_content, output_content;
   ProxyGroupConfigs lCustomProxyGroups = global.customProxyGroups;
@@ -686,8 +976,13 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
   if (std::find(gRegexBlacklist.cbegin(), gRegexBlacklist.cend(),
                 argIncludeRemark) != gRegexBlacklist.cend() ||
       std::find(gRegexBlacklist.cbegin(), gRegexBlacklist.cend(),
-                argExcludeRemark) != gRegexBlacklist.cend())
-    return "Invalid request!";
+                argExcludeRemark) != gRegexBlacklist.cend()) {
+    *status_code = 400;
+    return "Invalid request: include or exclude filter is not allowed.\n"
+           "无效请求：include 或 exclude 过滤条件不被允许。\n"
+           "Please remove blocked filter patterns and try again.\n"
+           "请移除被拦截的过滤表达式后重试。";
+  }
 
   /// for external configuration
   std::string lClashBase = global.clashBase, lSurgeBase = global.surgeBase,
@@ -705,7 +1000,11 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
   if ((argUrl.empty() && !(!global.insertUrls.empty() && argEnableInsert)) ||
       argTarget.empty()) {
     *status_code = 400;
-    return "Invalid request!";
+    return "Invalid request: missing required target or url parameter.\n"
+           "无效请求：缺少必需的 target 或 url 参数。\n"
+           "Please provide target and url; url may be omitted only when "
+           "configured insert nodes are enabled.\n"
+           "请提供 target 和 url；只有启用已配置的插入节点时才能省略 url。";
   }
 
   /// load request arguments as template variables
@@ -743,7 +1042,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
   /// check other flags
   ext.authorized = authorized;
   ext.append_proxy_type = argAppendType.get(global.appendType);
-  // 原项目（SubConverter）默认在 clash 目标下自动把 expand 设为 true
+  // 上游项目默认在 clash 目标下自动把 expand 设为 true
   // 本项目默认 expand=false（使用 rule-provider 模式不展开规则集）
   // 若用户主动传入 expand=true，则按照用户意愿内联展开规则集
   argExpandRulesets.define(false);
@@ -765,6 +1064,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
   ext.clash_new_field_name = argClashNewField.get(global.clashUseNewField);
   ext.clash_script = argGenClashScript.get();
   ext.clash_classical_ruleset = argGenClassicalRuleProvider.get();
+  ext.provider_proxy_direct = argProviderProxyDirect.get(true);
   // 无论 expand 取何值，均强制使用 Mihomo 新字段名（proxy-groups / rules）
   // 避免因全局配置为旧字段名而导致 Mihomo 无法识别
   ext.clash_new_field_name = true;
@@ -784,6 +1084,12 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
 
   /// load external configuration
   std::string userProvidedConfig = getUrlArg(argument, "config");
+  bool userProvidedExternalConfig = !argExternalConfig.empty();
+  FetchContext externalConfigContext =
+      userProvidedExternalConfig ? FetchContext::PublicRequest
+                                 : FetchContext::TrustedConfig;
+  FetchContext rulesetFetchContext = FetchContext::TrustedConfig;
+  FetchContext baseFetchContext = FetchContext::TrustedConfig;
   bool configLoadSuccess = false;
   string_map tpl_args_base = tpl_args.local_vars;
 
@@ -792,28 +1098,49 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
 
   if (!argExternalConfig.empty()) {
     // std::cerr<<"External configuration file provided. Loading...\n";
-    writeLog(0, "External configuration file provided. Loading...",
+    writeLog(0, "已提供外部配置文件，正在加载...",
              LOG_LEVEL_INFO);
     ExternalConfig extconf;
     extconf.tpl_args = &tpl_args;
-    int load_result = loadExternalConfig(argExternalConfig, extconf);
+    int load_result =
+        loadExternalConfig(argExternalConfig, extconf, externalConfigContext);
     if (load_result == 0 &&
         hasEffectiveExternalConfig(extconf, tpl_args, tpl_args_base)) {
       configLoadSuccess = true;
       if (!ext.nodelist) {
-        checkExternalBase(extconf.sssub_rule_base, lSSSubBase);
+        if (checkExternalBase(extconf.sssub_rule_base, lSSSubBase,
+                              externalConfigContext))
+          baseFetchContext = externalConfigContext;
         if (!lSimpleSubscription) {
-          checkExternalBase(extconf.clash_rule_base, lClashBase);
-          checkExternalBase(extconf.surge_rule_base, lSurgeBase);
-          checkExternalBase(extconf.surfboard_rule_base, lSurfboardBase);
-          checkExternalBase(extconf.mellow_rule_base, lMellowBase);
-          checkExternalBase(extconf.quan_rule_base, lQuanBase);
-          checkExternalBase(extconf.quanx_rule_base, lQuanXBase);
-          checkExternalBase(extconf.loon_rule_base, lLoonBase);
-          checkExternalBase(extconf.singbox_rule_base, lSingBoxBase);
+          if (checkExternalBase(extconf.clash_rule_base, lClashBase,
+                                externalConfigContext))
+            baseFetchContext = externalConfigContext;
+          if (checkExternalBase(extconf.surge_rule_base, lSurgeBase,
+                                externalConfigContext))
+            baseFetchContext = externalConfigContext;
+          if (checkExternalBase(extconf.surfboard_rule_base, lSurfboardBase,
+                                externalConfigContext))
+            baseFetchContext = externalConfigContext;
+          if (checkExternalBase(extconf.mellow_rule_base, lMellowBase,
+                                externalConfigContext))
+            baseFetchContext = externalConfigContext;
+          if (checkExternalBase(extconf.quan_rule_base, lQuanBase,
+                                externalConfigContext))
+            baseFetchContext = externalConfigContext;
+          if (checkExternalBase(extconf.quanx_rule_base, lQuanXBase,
+                                externalConfigContext))
+            baseFetchContext = externalConfigContext;
+          if (checkExternalBase(extconf.loon_rule_base, lLoonBase,
+                                externalConfigContext))
+            baseFetchContext = externalConfigContext;
+          if (checkExternalBase(extconf.singbox_rule_base, lSingBoxBase,
+                                externalConfigContext))
+            baseFetchContext = externalConfigContext;
 
-          if (!extconf.surge_ruleset.empty())
+          if (!extconf.surge_ruleset.empty()) {
             lCustomRulesets = extconf.surge_ruleset;
+            rulesetFetchContext = externalConfigContext;
+          }
           if (!extconf.custom_proxy_group.empty())
             lCustomProxyGroups = extconf.custom_proxy_group;
           ext.enable_rule_generator = extconf.enable_rule_generator;
@@ -837,8 +1164,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
       if (load_result == 0) {
         writeLog(
             0,
-            "External configuration loaded but contains no effective settings. "
-            "Treating as failure.",
+            "外部配置已加载，但未包含有效设置，按加载失败处理。",
             LOG_LEVEL_WARNING);
       }
     }
@@ -848,33 +1174,43 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
         argExternalConfig != global.defaultExtConfig) {
       // User provided config failed, try multiple fallback CDN URLs
       writeLog(
-          0, "Failed to load user provided config, trying fallback configs...",
+          0, "加载用户提供的配置失败，正在尝试回退配置...",
           LOG_LEVEL_WARNING);
 
       for (std::string fallbackUrl : FALLBACK_CONFIG_URLS) {
-        writeLog(0, "Attempting to load config from: " + fallbackUrl,
+        writeLog(0, "正在尝试加载配置：" + fallbackUrl,
                  LOG_LEVEL_INFO);
 
         tpl_args.local_vars = tpl_args_base;
         ExternalConfig extconf;
         extconf.tpl_args = &tpl_args;
-        int fallback_result = loadExternalConfig(fallbackUrl, extconf);
+        int fallback_result =
+            loadExternalConfig(fallbackUrl, extconf, FetchContext::TrustedConfig);
         if (fallback_result == 0 &&
             hasEffectiveExternalConfig(extconf, tpl_args, tpl_args_base)) {
-          writeLog(0, "Successfully loaded config from: " + fallbackUrl,
+          writeLog(0, "已成功加载配置：" + fallbackUrl,
                    LOG_LEVEL_INFO);
           configLoadSuccess = true;
           if (!ext.nodelist) {
-            checkExternalBase(extconf.sssub_rule_base, lSSSubBase);
+            checkExternalBase(extconf.sssub_rule_base, lSSSubBase,
+                              FetchContext::TrustedConfig);
             if (!lSimpleSubscription) {
-              checkExternalBase(extconf.clash_rule_base, lClashBase);
-              checkExternalBase(extconf.surge_rule_base, lSurgeBase);
-              checkExternalBase(extconf.surfboard_rule_base, lSurfboardBase);
-              checkExternalBase(extconf.mellow_rule_base, lMellowBase);
-              checkExternalBase(extconf.quan_rule_base, lQuanBase);
-              checkExternalBase(extconf.quanx_rule_base, lQuanXBase);
-              checkExternalBase(extconf.loon_rule_base, lLoonBase);
-              checkExternalBase(extconf.singbox_rule_base, lSingBoxBase);
+              checkExternalBase(extconf.clash_rule_base, lClashBase,
+                                FetchContext::TrustedConfig);
+              checkExternalBase(extconf.surge_rule_base, lSurgeBase,
+                                FetchContext::TrustedConfig);
+              checkExternalBase(extconf.surfboard_rule_base, lSurfboardBase,
+                                FetchContext::TrustedConfig);
+              checkExternalBase(extconf.mellow_rule_base, lMellowBase,
+                                FetchContext::TrustedConfig);
+              checkExternalBase(extconf.quan_rule_base, lQuanBase,
+                                FetchContext::TrustedConfig);
+              checkExternalBase(extconf.quanx_rule_base, lQuanXBase,
+                                FetchContext::TrustedConfig);
+              checkExternalBase(extconf.loon_rule_base, lLoonBase,
+                                FetchContext::TrustedConfig);
+              checkExternalBase(extconf.singbox_rule_base, lSingBoxBase,
+                                FetchContext::TrustedConfig);
 
               if (!extconf.surge_ruleset.empty())
                 lCustomRulesets = extconf.surge_ruleset;
@@ -902,18 +1238,17 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
           if (fallback_result == 0) {
             writeLog(
                 0,
-                "Loaded config from: " + fallbackUrl +
-                    " but found no effective settings. Skipping.",
+                "已从 " + fallbackUrl + " 加载配置，但未发现有效设置，跳过。",
                 LOG_LEVEL_WARNING);
           } else {
-            writeLog(0, "Failed to load config from: " + fallbackUrl,
+            writeLog(0, "加载配置失败：" + fallbackUrl,
                      LOG_LEVEL_WARNING);
           }
         }
       }
 
       if (!configLoadSuccess) {
-        writeLog(0, "All fallback config URLs failed to load", LOG_LEVEL_ERROR);
+        writeLog(0, "所有回退配置 URL 均加载失败。", LOG_LEVEL_ERROR);
       }
     }
   }
@@ -931,12 +1266,13 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
       if (!argCustomRulesets.empty() && !ext.nodelist) {
         string_array vArray = split(argCustomRulesets, "@");
         lCustomRulesets = INIBinding::from<RulesetConfig>::from_ini(vArray);
+        rulesetFetchContext = FetchContext::PublicRequest;
       }
     }
   }
   if (ext.enable_rule_generator && !ext.nodelist && !lSimpleSubscription) {
     if (lCustomRulesets != global.customRulesets)
-      refreshRulesets(lCustomRulesets, lRulesetContent);
+      refreshRulesets(lCustomRulesets, lRulesetContent, rulesetFetchContext);
     else {
       if (global.updateRulesetOnRequest)
         refreshRulesets(global.customRulesets, global.rulesetsContent);
@@ -991,6 +1327,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
   parse_set.sub_info = &subInfo;
   parse_set.authorized = authorized;
   parse_set.request_header = &request.headers;
+  parse_set.fetch_context = FetchContext::TrustedConfig;
   parse_set.js_runtime = ext.js_runtime;
   parse_set.js_context = ext.js_context;
 
@@ -1000,21 +1337,29 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
     importItems(urls, true);
     for (std::string &x : urls) {
       x = regTrim(x);
-      writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
+      writeLog(0, "正在从 URL 获取节点数据：'" + x + "'。", LOG_LEVEL_INFO);
       if (addNodes(x, insert_nodes, groupID, parse_set) == -1) {
         if (global.skipFailedLinks)
           writeLog(
-              0, "The following link doesn't contain any valid node info: " + x,
+              0, "以下链接不包含任何有效节点信息：" + x,
               LOG_LEVEL_WARNING);
         else {
           *status_code = 400;
-          return "The following link doesn't contain any valid node info: " + x;
+          return "Invalid request: this link does not contain any supported "
+                 "proxy nodes.\n"
+                 "无效请求：该链接不包含任何受支持的代理节点。\n"
+                 "Please check whether the link is reachable and the node URI "
+                 "format is supported.\n"
+                 "请检查链接是否可访问，以及节点 URI 格式是否受支持。\n"
+                 "Link / 链接: " +
+                 x;
         }
       }
       groupID--;
     }
   }
   urls = split(argUrl, "|");
+  parse_set.fetch_context = FetchContext::PublicRequest;
   groupID = 0;
 
   //  对于 Clash，区分节点链接和订阅链接
@@ -1034,27 +1379,21 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
       TaggedLink tagged = parseTaggedLink(x);
       std::string link = tagged.link.empty() ? x : tagged.link;
 
-      // 检查是否是节点链接（以协议前缀开头）
-      bool isNodeLink =
-          startsWith(link, "vless://") || startsWith(link, "vmess://") ||
-          startsWith(link, "ss://") || startsWith(link, "ssr://") ||
-          startsWith(link, "trojan://") || startsWith(link, "hysteria://") ||
-          startsWith(link, "hysteria2://") || startsWith(link, "hy2://") ||
-          startsWith(link, "tuic://") || startsWith(link, "snell://") ||
-          startsWith(link, "socks5://") || startsWith(link, "socks://");
+      // Keep HTTP(S)/data links available for proxy-provider mode. Other
+      // Mihomo-supported schemes are direct node links.
+      bool isNodeLink = mihomo::isSupportedNonHttpSchemeLink(link);
 
       if (isNodeLink) {
         std::string node_link = link;
         if (tagged.has_tag)
           node_link = "tag:" + tagged.tag + "," + link;
-        writeLog(0, "Detected node link: '" + link + "', will parse directly.",
+        writeLog(0, "检测到节点链接：'" + link + "'，将直接解析。",
                  LOG_LEVEL_INFO);
         node_urls.push_back(node_link);
-      } else if (isLink(link)) {
+      } else if (isLink(link) || mihomo::isHttpSchemeLink(link)) {
         // HTTP/HTTPS 订阅链接
         writeLog(
-            0, "Detected subscription link: '" + link +
-                   "', will create provider.",
+            0, "检测到订阅链接：'" + link + "'，将创建 provider。",
             LOG_LEVEL_INFO);
         subscription_urls.push_back(
             {link, tagged.tag, tagged.provider, tagged.link_decoded});
@@ -1062,7 +1401,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
         std::string node_link = link;
         if (tagged.has_tag)
           node_link = "tag:" + tagged.tag + "," + link;
-        writeLog(0, "Unknown URL type: '" + link + "', treating as node link.",
+        writeLog(0, "未知 URL 类型：'" + link + "'，按节点链接处理。",
                  LOG_LEVEL_WARNING);
         node_urls.push_back(node_link);
       }
@@ -1070,7 +1409,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
 
     // 只有当有订阅链接时才启用 proxy-provider 模式
     if (!subscription_urls.empty()) {
-      writeLog(0, "Found subscription URLs, enabling proxy-provider mode.",
+      writeLog(0, "检测到订阅 URL，启用 proxy-provider 模式。",
                LOG_LEVEL_INFO);
       ext.use_proxy_provider = true;
       std::unordered_set<std::string> provider_names;
@@ -1118,7 +1457,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
         provider.name = reserve_provider_name(base_name);
         provider.tag = item.tag;
         writeLog(0,
-                 "Generated provider: " + provider.name + " for URL: " +
+                 "已生成 provider：" + provider.name + "，URL：" +
                      item.url,
                  LOG_LEVEL_INFO);
         provider.url = item.url_decoded ? item.url
@@ -1140,7 +1479,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
       }
     } else {
       // 没有订阅链接，禁用 proxy-provider 模式
-      writeLog(0, "No subscription URLs found, disabling proxy-provider mode.",
+      writeLog(0, "未检测到订阅 URL，禁用 proxy-provider 模式。",
                LOG_LEVEL_INFO);
       ext.use_proxy_provider = false;
     }
@@ -1148,18 +1487,17 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
     // 节点链接使用原有逻辑直接解析
     if (!node_urls.empty()) {
       writeLog(0,
-               "Parsing " + std::to_string(node_urls.size()) +
-                   " node links directly.",
+               "正在直接解析 " + std::to_string(node_urls.size()) +
+                   " 个节点链接。",
                LOG_LEVEL_INFO);
-      importItems(node_urls, true);
+      importItems(node_urls, true, FetchContext::PublicRequest);
       // 关键：实际添加节点到 nodes 列表
       for (std::string &x : node_urls) {
-        writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
+        writeLog(0, "正在从 URL 获取节点数据：'" + x + "'。", LOG_LEVEL_INFO);
         if (addNodes(x, nodes, groupID, parse_set) == -1) {
           // 跳过无法解析的节点链接，记录警告后继续处理其他节点
           writeLog(0,
-                   "Skipped invalid node link: '" + x +
-                       "', continuing with other nodes.",
+                   "已跳过无效节点链接：'" + x + "'，继续处理其他节点。",
                    LOG_LEVEL_WARNING);
         }
         groupID++;
@@ -1167,16 +1505,16 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
     }
   } else {
     // 其他格式保持原有逻辑，完全展开节点
-    importItems(urls, true); // 只为非 proxy-provider 模式处理 import 语法
+    importItems(urls, true,
+                FetchContext::PublicRequest); // 只为非 proxy-provider 模式处理 import 语法
     for (std::string &x : urls) {
       x = regTrim(x);
       // std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
-      writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
+      writeLog(0, "正在从 URL 获取节点数据：'" + x + "'。", LOG_LEVEL_INFO);
       if (addNodes(x, nodes, groupID, parse_set) == -1) {
         // 跳过无法解析的节点链接，记录警告后继续处理其他节点
         writeLog(0,
-                 "Skipped invalid node link: '" + x +
-                     "', continuing with other nodes.",
+                 "已跳过无效节点链接：'" + x + "'，继续处理其他节点。",
                  LOG_LEVEL_WARNING);
       }
       groupID++;
@@ -1186,13 +1524,28 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
   // 对于 proxy-provider 模式，允许 nodes 为空（节点从 provider 获取）
   if (nodes.empty() && insert_nodes.empty() && ext.providers.empty()) {
     *status_code = 400;
-    return "No nodes were found!";
+    return "Invalid request: no valid proxy nodes or proxy providers were "
+           "found.\n"
+           "无效请求：未找到有效的代理节点或代理提供者。\n"
+           "Please check whether the subscription URL or node URI format is "
+           "supported, and whether filters excluded all nodes.\n"
+           "请检查订阅链接或节点 URI 格式是否受支持，以及过滤规则是否排除了所有节点。";
   }
   if (!subInfo.empty() && argAppendUserinfo.get(global.appendUserinfo))
     response.headers.emplace("Subscription-UserInfo", subInfo);
 
   if (request.method == "HEAD")
     return "";
+
+  if (argUpload && !isPublicUploadAllowed()) {
+    *status_code = 403;
+    return "Upload is disabled for the current security profile.\n"
+           "当前安全档位已禁用公开请求上传。\n"
+           "Use security.profile=lan for private deployments, or explicitly "
+           "enable security.allow_public_upload in public profile.\n"
+           "内网私有部署请使用 security.profile=lan；公网档位如确需上传，"
+           "请显式开启 security.allow_public_upload。";
+  }
 
   argPrependInsert.define(global.prependInsert);
   if (argPrependInsert) {
@@ -1228,7 +1581,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
         }
         else
         {
-            writeLog(0, "Error when trying to parse script:\n" +
+            writeLog(0, "解析脚本时发生错误：\n" +
     duktape_get_err_stack(ctx), LOG_LEVEL_ERROR); duk_pop(ctx); /// pop err
         }
     }
@@ -1284,8 +1637,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
   case "clash"_hash:
   case "clashr"_hash:
     writeLog(0,
-             argTarget == "clashr" ? "Generate target: ClashR"
-                                   : "Generate target: Clash",
+             argTarget == "clashr" ? "生成目标：ClashR" : "生成目标：Clash",
              LOG_LEVEL_INFO);
     tpl_args.local_vars["clash.new_field_name"] =
         ext.clash_new_field_name ? "true" : "false";
@@ -1296,8 +1648,10 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
       proxyToClash(nodes, yamlnode, dummy_group, argTarget == "clashr", ext);
       output_content = YAML::Dump(yamlnode);
     } else {
-      if (render_template(fetchFile(lClashBase, proxy, global.cacheConfig),
-                          tpl_args, base_content, global.templatePath) != 0) {
+      if (render_template(fetchFile(lClashBase, proxy, global.cacheConfig,
+                                    true, baseFetchContext),
+                          tpl_args, base_content, global.templatePath,
+                          baseFetchContext) != 0) {
         *status_code = 400;
         return base_content;
       }
@@ -1311,7 +1665,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
     break;
   case "surge"_hash:
 
-    writeLog(0, "Generate target: Surge " + std::to_string(intSurgeVer),
+    writeLog(0, "生成目标：Surge " + std::to_string(intSurgeVer),
              LOG_LEVEL_INFO);
 
     if (ext.nodelist) {
@@ -1322,8 +1676,10 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
         uploadGist("surge" + argSurgeVer + "list", argUploadPath,
                    output_content, true);
     } else {
-      if (render_template(fetchFile(lSurgeBase, proxy, global.cacheConfig),
-                          tpl_args, base_content, global.templatePath) != 0) {
+      if (render_template(fetchFile(lSurgeBase, proxy, global.cacheConfig,
+                                    true, baseFetchContext),
+                          tpl_args, base_content, global.templatePath,
+                          baseFetchContext) != 0) {
         *status_code = 400;
         return base_content;
       }
@@ -1342,10 +1698,12 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
     }
     break;
   case "surfboard"_hash:
-    writeLog(0, "Generate target: Surfboard", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：Surfboard", LOG_LEVEL_INFO);
 
-    if (render_template(fetchFile(lSurfboardBase, proxy, global.cacheConfig),
-                        tpl_args, base_content, global.templatePath) != 0) {
+    if (render_template(fetchFile(lSurfboardBase, proxy, global.cacheConfig,
+                                  true, baseFetchContext),
+                        tpl_args, base_content, global.templatePath,
+                        baseFetchContext) != 0) {
       *status_code = 400;
       return base_content;
     }
@@ -1362,10 +1720,12 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
           output_content;
     break;
   case "mellow"_hash:
-    writeLog(0, "Generate target: Mellow", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：Mellow", LOG_LEVEL_INFO);
 
-    if (render_template(fetchFile(lMellowBase, proxy, global.cacheConfig),
-                        tpl_args, base_content, global.templatePath) != 0) {
+    if (render_template(fetchFile(lMellowBase, proxy, global.cacheConfig, true,
+                                  baseFetchContext),
+                        tpl_args, base_content, global.templatePath,
+                        baseFetchContext) != 0) {
       *status_code = 400;
       return base_content;
     }
@@ -1376,10 +1736,12 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
       uploadGist("mellow", argUploadPath, output_content, true);
     break;
   case "sssub"_hash:
-    writeLog(0, "Generate target: SS Subscription", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：SS Subscription", LOG_LEVEL_INFO);
 
-    if (render_template(fetchFile(lSSSubBase, proxy, global.cacheConfig),
-                        tpl_args, base_content, global.templatePath) != 0) {
+    if (render_template(fetchFile(lSSSubBase, proxy, global.cacheConfig, true,
+                                  baseFetchContext),
+                        tpl_args, base_content, global.templatePath,
+                        baseFetchContext) != 0) {
       *status_code = 400;
       return base_content;
     }
@@ -1388,52 +1750,54 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
       uploadGist("sssub", argUploadPath, output_content, false);
     break;
   case "ss"_hash:
-    writeLog(0, "Generate target: SS", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：SS", LOG_LEVEL_INFO);
     output_content = proxyToSingle(nodes, 1, ext);
     if (argUpload)
       uploadGist("ss", argUploadPath, output_content, false);
     break;
   case "ssr"_hash:
-    writeLog(0, "Generate target: SSR", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：SSR", LOG_LEVEL_INFO);
     output_content = proxyToSingle(nodes, 2, ext);
     if (argUpload)
       uploadGist("ssr", argUploadPath, output_content, false);
     break;
   case "v2ray"_hash:
-    writeLog(0, "Generate target: v2rayN", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：v2rayN", LOG_LEVEL_INFO);
     output_content = proxyToSingle(nodes, 4, ext);
     if (argUpload)
       uploadGist("v2ray", argUploadPath, output_content, false);
     break;
   case "trojan"_hash:
-    writeLog(0, "Generate target: Trojan", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：Trojan", LOG_LEVEL_INFO);
     output_content = proxyToSingle(nodes, 8, ext);
     if (argUpload)
       uploadGist("trojan", argUploadPath, output_content, false);
     break;
   case "vless"_hash:
-    writeLog(0, "Generate target: vless", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：vless", LOG_LEVEL_INFO);
     output_content = proxyToSingle(nodes, 16, ext);
     if (argUpload)
       uploadGist("vless", argUploadPath, output_content, false);
     break;
   case "hysteria2"_hash:
-    writeLog(0, "Generate target: hysteria2", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：hysteria2", LOG_LEVEL_INFO);
     output_content = proxyToSingle(nodes, 32, ext);
     if (argUpload)
       uploadGist("hysteria2", argUploadPath, output_content, false);
     break;
   case "mixed"_hash:
-    writeLog(0, "Generate target: Standard Subscription", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：Standard Subscription", LOG_LEVEL_INFO);
     output_content = proxyToSingle(nodes, 63, ext);
     if (argUpload)
       uploadGist("sub", argUploadPath, output_content, false);
     break;
   case "quan"_hash:
-    writeLog(0, "Generate target: Quantumult", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：Quantumult", LOG_LEVEL_INFO);
     if (!ext.nodelist) {
-      if (render_template(fetchFile(lQuanBase, proxy, global.cacheConfig),
-                          tpl_args, base_content, global.templatePath) != 0) {
+      if (render_template(fetchFile(lQuanBase, proxy, global.cacheConfig, true,
+                                    baseFetchContext),
+                          tpl_args, base_content, global.templatePath,
+                          baseFetchContext) != 0) {
         *status_code = 400;
         return base_content;
       }
@@ -1446,10 +1810,12 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
       uploadGist("quan", argUploadPath, output_content, false);
     break;
   case "quanx"_hash:
-    writeLog(0, "Generate target: Quantumult X", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：Quantumult X", LOG_LEVEL_INFO);
     if (!ext.nodelist) {
-      if (render_template(fetchFile(lQuanXBase, proxy, global.cacheConfig),
-                          tpl_args, base_content, global.templatePath) != 0) {
+      if (render_template(fetchFile(lQuanXBase, proxy, global.cacheConfig,
+                                    true, baseFetchContext),
+                          tpl_args, base_content, global.templatePath,
+                          baseFetchContext) != 0) {
         *status_code = 400;
         return base_content;
       }
@@ -1462,10 +1828,12 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
       uploadGist("quanx", argUploadPath, output_content, false);
     break;
   case "loon"_hash:
-    writeLog(0, "Generate target: Loon", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：Loon", LOG_LEVEL_INFO);
     if (!ext.nodelist) {
-      if (render_template(fetchFile(lLoonBase, proxy, global.cacheConfig),
-                          tpl_args, base_content, global.templatePath) != 0) {
+      if (render_template(fetchFile(lLoonBase, proxy, global.cacheConfig, true,
+                                    baseFetchContext),
+                          tpl_args, base_content, global.templatePath,
+                          baseFetchContext) != 0) {
         *status_code = 400;
         return base_content;
       }
@@ -1478,16 +1846,18 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
       uploadGist("loon", argUploadPath, output_content, false);
     break;
   case "ssd"_hash:
-    writeLog(0, "Generate target: SSD", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：SSD", LOG_LEVEL_INFO);
     output_content = proxyToSSD(nodes, argGroupName, subInfo, ext);
     if (argUpload)
       uploadGist("ssd", argUploadPath, output_content, false);
     break;
   case "singbox"_hash:
-    writeLog(0, "Generate target: sing-box", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：sing-box", LOG_LEVEL_INFO);
     if (!ext.nodelist) {
-      if (render_template(fetchFile(lSingBoxBase, proxy, global.cacheConfig),
-                          tpl_args, base_content, global.templatePath) != 0) {
+      if (render_template(fetchFile(lSingBoxBase, proxy, global.cacheConfig,
+                                    true, baseFetchContext),
+                          tpl_args, base_content, global.templatePath,
+                          baseFetchContext) != 0) {
         *status_code = 400;
         return base_content;
       }
@@ -1500,11 +1870,15 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS) {
       uploadGist("singbox", argUploadPath, output_content, false);
     break;
   default:
-    writeLog(0, "Generate target: Unspecified", LOG_LEVEL_INFO);
+    writeLog(0, "生成目标：未指定", LOG_LEVEL_INFO);
     *status_code = 500;
-    return "Unrecognized target";
+    return "Internal error: target passed validation but no generator handled "
+           "it.\n"
+           "内部错误：target 已通过校验，但没有对应的生成器处理它。\n"
+           "Please report this request to the service maintainer.\n"
+           "请将该请求反馈给服务维护者。";
   }
-  writeLog(0, "Generate completed.", LOG_LEVEL_INFO);
+  writeLog(0, "生成完成。", LOG_LEVEL_INFO);
   if (!argFilename.empty())
     response.headers.emplace("Content-Disposition",
                              "attachment; filename=\"" + argFilename +
@@ -1520,12 +1894,18 @@ std::string simpleToClashR(RESPONSE_CALLBACK_ARGS) {
   std::string url = argument.size() <= 8 ? "" : argument.substr(8);
   if (url.empty() || argument.substr(0, 8) != "sublink=") {
     *status_code = 400;
-    return "Invalid request!";
+    return "Invalid request: missing sublink parameter.\n"
+           "无效请求：缺少 sublink 参数。\n"
+           "Please call this endpoint as /sub2clashr?sublink=<subscription-url>.\n"
+           "请使用 /sub2clashr?sublink=<订阅链接> 调用该接口。";
   }
   if (url == "sublink") {
     *status_code = 400;
-    return "Please insert your subscription link instead of clicking the "
-           "default link.";
+    return "Invalid request: the default placeholder was not replaced with a "
+           "subscription link.\n"
+           "无效请求：默认占位符没有被替换为订阅链接。\n"
+           "Please provide a real subscription URL in the sublink parameter.\n"
+           "请在 sublink 参数中提供真实订阅链接。";
   }
   request.argument.emplace("target", "clashr");
   request.argument.emplace("url", urlEncode(url));
@@ -1551,14 +1931,21 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS) {
     url = global.defaultUrls;
   if (url.empty() || argument.substr(0, 5) != "link=") {
     *status_code = 400;
-    return "Invalid request!";
+    return "Invalid request: missing link parameter.\n"
+           "无效请求：缺少 link 参数。\n"
+           "Please call this endpoint as /surge2clash?link=<surge-config-url>.\n"
+           "请使用 /surge2clash?link=<Surge配置链接> 调用该接口。";
   }
   if (url == "link") {
     *status_code = 400;
-    return "Please insert your subscription link instead of clicking the "
-           "default link.";
+    return "Invalid request: the default placeholder was not replaced with a "
+           "Surge configuration link.\n"
+           "无效请求：默认占位符没有被替换为 Surge 配置链接。\n"
+           "Please provide a real Surge configuration URL in the link "
+           "parameter.\n"
+           "请在 link 参数中提供真实 Surge 配置链接。";
   }
-  writeLog(0, "SurgeConfToClash called with url '" + url + "'.",
+  writeLog(0, "SurgeConfToClash 调用，URL：'" + url + "'。",
            LOG_LEVEL_INFO);
 
   std::string proxy = parseProxy(global.proxyConfig);
@@ -1580,18 +1967,27 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS) {
   base_content = fetchFile(url, proxy, global.cacheConfig);
 
   if (ini.parse(base_content) != INIREADER_EXCEPTION_NONE) {
-    std::string errmsg =
-        "Parsing Surge config failed! Reason: " + ini.get_last_error();
+    std::string errmsg = "Invalid request: failed to parse Surge "
+                         "configuration.\n"
+                         "无效请求：Surge 配置解析失败。\n"
+                         "Reason / 原因: " +
+                         ini.get_last_error();
     // std::cerr<<errmsg<<"\n";
-    writeLog(0, errmsg, LOG_LEVEL_ERROR);
+    writeLog(0, "Surge 配置解析失败。原因：" + ini.get_last_error(),
+             LOG_LEVEL_ERROR);
     *status_code = 400;
     return errmsg;
   }
   if (!ini.section_exist("Proxy") || !ini.section_exist("Proxy Group") ||
       !ini.section_exist("Rule")) {
-    std::string errmsg = "Incomplete surge config! Missing critical sections!";
+    std::string errmsg =
+        "Invalid request: incomplete Surge configuration.\n"
+        "无效请求：Surge 配置不完整。\n"
+        "Required sections: [Proxy], [Proxy Group], and [Rule].\n"
+        "必须包含以下配置段：[Proxy]、[Proxy Group] 和 [Rule]。";
     // std::cerr<<errmsg<<"\n";
-    writeLog(0, errmsg, LOG_LEVEL_ERROR);
+    writeLog(0, "Surge 配置不完整，缺少必需配置段。",
+             LOG_LEVEL_ERROR);
     *status_code = 400;
     return errmsg;
   }
@@ -1647,15 +2043,22 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS) {
   parse_set.authorized = !global.APIMode;
   for (std::string &x : links) {
     // std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
-    writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
+    writeLog(0, "正在从 URL 获取节点数据：'" + x + "'。", LOG_LEVEL_INFO);
     if (addNodes(x, nodes, 0, parse_set) == -1) {
       if (global.skipFailedLinks)
         writeLog(0,
-                 "The following link doesn't contain any valid node info: " + x,
+                 "以下链接不包含任何有效节点信息：" + x,
                  LOG_LEVEL_WARNING);
       else {
         *status_code = 400;
-        return "The following link doesn't contain any valid node info: " + x;
+        return "Invalid request: this link does not contain any supported "
+               "proxy nodes.\n"
+               "无效请求：该链接不包含任何受支持的代理节点。\n"
+               "Please check whether the link is reachable and the node URI "
+               "format is supported.\n"
+               "请检查链接是否可访问，以及节点 URI 格式是否受支持。\n"
+               "Link / 链接: " +
+               x;
       }
     }
   }
@@ -1663,7 +2066,12 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS) {
   // exit if found nothing
   if (nodes.empty()) {
     *status_code = 400;
-    return "No nodes were found!";
+    return "Invalid request: no valid proxy nodes were found in the Surge "
+           "configuration or its policy-path subscriptions.\n"
+           "无效请求：Surge 配置或其 policy-path 订阅中未找到有效代理节点。\n"
+           "Please check whether the source configuration contains supported "
+           "proxy entries.\n"
+           "请检查源配置中是否包含受支持的代理条目。";
   }
 
   extra_settings ext;
@@ -1755,7 +2163,7 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS) {
 
   response.headers["profile-update-interval"] =
       std::to_string(global.updateInterval / 3600);
-  writeLog(0, "Conversion completed.", LOG_LEVEL_INFO);
+  writeLog(0, "转换完成。", LOG_LEVEL_INFO);
   return YAML::Dump(clash);
 }
 
@@ -1768,7 +2176,8 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
   string_array profiles = split(name, "|");
   if (token.empty() || profiles.empty()) {
     *status_code = 403;
-    return "Forbidden";
+    return "Forbidden: missing profile name or access token.\n"
+           "禁止访问：缺少配置名称或访问令牌。";
   }
   std::string profile_content;
   name = profiles[0];
@@ -1781,29 +2190,38 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
     profile_content = fileGet(name, true);
   } else {
     *status_code = 404;
-    return "Profile not found";
+    return "Profile not found: the requested profile does not exist.\n"
+           "未找到配置：请求的 profile 不存在。\n"
+           "Profile / 配置: " +
+           name;
   }
   // std::cerr<<"Trying to load profile '" + name + "'.\n";
-  writeLog(0, "Trying to load profile '" + name + "'.", LOG_LEVEL_INFO);
+  writeLog(0, "正在加载配置档：'" + name + "'。", LOG_LEVEL_INFO);
   INIReader ini;
   if (ini.parse(profile_content) != INIREADER_EXCEPTION_NONE &&
       !ini.section_exist("Profile")) {
     // std::cerr<<"Load profile failed! Reason: "<<ini.get_last_error()<<"\n";
-    writeLog(0, "Load profile failed! Reason: " + ini.get_last_error(),
+    writeLog(0, "加载配置档失败！原因：" + ini.get_last_error(),
              LOG_LEVEL_ERROR);
     *status_code = 500;
-    return "Broken profile!";
+    return "Invalid profile: failed to parse profile content.\n"
+           "无效配置：profile 内容解析失败。\n"
+           "Reason / 原因: " +
+           ini.get_last_error();
   }
   // std::cerr<<"Trying to parse profile '" + name + "'.\n";
-  writeLog(0, "Trying to parse profile '" + name + "'.", LOG_LEVEL_INFO);
+  writeLog(0, "正在解析配置档：'" + name + "'。", LOG_LEVEL_INFO);
   string_multimap contents;
   ini.get_items("Profile", contents);
   if (contents.empty()) {
     // std::cerr<<"Load profile failed! Reason: Empty Profile section\n";
-    writeLog(0, "Load profile failed! Reason: Empty Profile section",
+    writeLog(0, "加载配置档失败！原因：[Profile] 配置段为空。",
              LOG_LEVEL_ERROR);
     *status_code = 500;
-    return "Broken profile!";
+    return "Invalid profile: [Profile] section is empty.\n"
+           "无效配置：[Profile] 配置段为空。\n"
+           "Please add at least one profile entry before requesting it.\n"
+           "请至少添加一个 profile 条目后再请求。";
   }
   // Token authentication has been disabled - these checks are removed
   // All authentication logic is now bypassed
@@ -1812,7 +2230,7 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
   // }
   /// check if more than one profile is provided
   if (profiles.size() > 1) {
-    writeLog(0, "Multiple profiles are provided. Trying to combine profiles...",
+    writeLog(0, "检测到多个配置档，正在合并...",
              LOG_TYPE_INFO);
     std::string all_urls, url;
     auto iter = contents.find("url");
@@ -1821,22 +2239,22 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
     for (size_t i = 1; i < profiles.size(); i++) {
       name = profiles[i];
       if (!fileExist(name)) {
-        writeLog(0, "Ignoring non-exist profile '" + name + "'...",
+        writeLog(0, "忽略不存在的配置档：'" + name + "'。",
                  LOG_LEVEL_WARNING);
         continue;
       }
       if (ini.parse_file(name) != INIREADER_EXCEPTION_NONE &&
           !ini.section_exist("Profile")) {
-        writeLog(0, "Ignoring broken profile '" + name + "'...",
+        writeLog(0, "忽略损坏的配置档：'" + name + "'。",
                  LOG_LEVEL_WARNING);
         continue;
       }
       url = ini.get("Profile", "url");
       if (!url.empty()) {
         all_urls += "|" + url;
-        writeLog(0, "Profile url from '" + name + "' added.", LOG_LEVEL_INFO);
+        writeLog(0, "已添加来自配置档 '" + name + "' 的 URL。", LOG_LEVEL_INFO);
       } else {
-        writeLog(0, "Profile '" + name + "' does not have url key. Skipping...",
+        writeLog(0, "配置档 '" + name + "' 没有 url 字段，跳过。",
                  LOG_LEVEL_INFO);
       }
     }
@@ -1857,7 +2275,7 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
 std::string jinja2_webGet(const std::string &url)
 {
     std::string proxy = parseProxy(global.proxyConfig);
-    writeLog(0, "Template called fetch with url '" + url + "'.",
+    writeLog(0, "模板调用 fetch，URL：'" + url + "'。",
 LOG_LEVEL_INFO); return webGet(url, proxy, global.cacheConfig);
 }*/
 
@@ -1898,20 +2316,20 @@ std::string subInfoToMessage(std::string subinfo) {
     expirydata.assign(buffer);
   }
   if (useddata == "N/A" && totaldata == "N/A" && expirydata == "N/A")
-    retdata = "Not Available";
+    retdata = "不可用";
   else
-    retdata += "Stream Used: " + useddata + " Stream Total: " + totaldata +
-               " Expiry Time: " + expirydata;
+    retdata += "已用流量：" + useddata + " 总流量：" + totaldata +
+               " 到期时间：" + expirydata;
   return retdata;
 }
 
 int simpleGenerator() {
   // std::cerr<<"\nReading generator configuration...\n";
-  writeLog(0, "Reading generator configuration...", LOG_LEVEL_INFO);
+  writeLog(0, "正在读取生成器配置...", LOG_LEVEL_INFO);
   std::string config = fileGet("generate.ini"), path, profile, content;
   if (config.empty()) {
     // std::cerr<<"Generator configuration not found or empty!\n";
-    writeLog(0, "Generator configuration not found or empty!", LOG_LEVEL_ERROR);
+    writeLog(0, "未找到生成器配置，或配置为空！", LOG_LEVEL_ERROR);
     return -1;
   }
 
@@ -1920,20 +2338,19 @@ int simpleGenerator() {
     // std::cerr<<"Generator configuration broken!
     // Reason:"<<ini.get_last_error()<<"\n";
     writeLog(0,
-             "Generator configuration broken! Reason:" + ini.get_last_error(),
+             "生成器配置损坏！原因：" + ini.get_last_error(),
              LOG_LEVEL_ERROR);
     return -2;
   }
   // std::cerr<<"Read generator configuration completed.\n\n";
-  writeLog(0, "Read generator configuration completed.\n", LOG_LEVEL_INFO);
+  writeLog(0, "生成器配置读取完成。\n", LOG_LEVEL_INFO);
 
   string_array sections = ini.get_section_names();
   if (!global.generateProfiles.empty()) {
     // std::cerr<<"Generating with specific artifacts:
     // \""<<gen_profile<<"\"...\n";
     writeLog(0,
-             "Generating with specific artifacts: \"" +
-                 global.generateProfiles + "\"...",
+             "正在按指定生成项生成：\"" + global.generateProfiles + "\"...",
              LOG_LEVEL_INFO);
     string_array targets = split(global.generateProfiles, ","), new_targets;
     for (std::string &x : targets) {
@@ -1942,7 +2359,7 @@ int simpleGenerator() {
         new_targets.emplace_back(std::move(x));
       else {
         // std::cerr<<"Artifact \""<<x<<"\" not found in generator settings!\n";
-        writeLog(0, "Artifact \"" + x + "\" not found in generator settings!",
+        writeLog(0, "生成器设置中未找到生成项：\"" + x + "\"！",
                  LOG_LEVEL_ERROR);
         return -3;
       }
@@ -1951,7 +2368,7 @@ int simpleGenerator() {
     sections.shrink_to_fit();
   } else
     // std::cerr<<"Generating all artifacts...\n";
-    writeLog(0, "Generating all artifacts...", LOG_LEVEL_INFO);
+    writeLog(0, "正在生成所有生成项...", LOG_LEVEL_INFO);
 
   string_multimap allItems;
   std::string proxy = parseProxy(global.proxySubscription);
@@ -1960,13 +2377,13 @@ int simpleGenerator() {
   for (std::string &x : sections) {
     response.status_code = 200;
     // std::cerr<<"Generating artifact '"<<x<<"'...\n";
-    writeLog(0, "Generating artifact '" + x + "'...", LOG_LEVEL_INFO);
+    writeLog(0, "正在生成生成项：'" + x + "'。", LOG_LEVEL_INFO);
     ini.enter_section(x);
     if (ini.item_exist("path"))
       path = ini.get("path");
     else {
       // std::cerr<<"Artifact '"<<x<<"' output path missing! Skipping...\n\n";
-      writeLog(0, "Artifact '" + x + "' output path missing! Skipping...\n",
+      writeLog(0, "生成项 '" + x + "' 缺少输出路径，跳过。\n",
                LOG_LEVEL_ERROR);
       continue;
     }
@@ -1984,8 +2401,7 @@ int simpleGenerator() {
           // std::cerr<<"Artifact '"<<x<<"' generate ERROR! Please check your
           // link.\n\n";
           writeLog(0,
-                   "Artifact '" + x +
-                       "' generate ERROR! Please check your link.\n",
+                   "生成项 '" + x + "' 生成失败！请检查链接。\n",
                    LOG_LEVEL_ERROR);
           if (sections.size() == 1)
             return -1;
@@ -2007,7 +2423,7 @@ int simpleGenerator() {
       // std::cerr<<"Artifact '"<<x<<"' generate ERROR! Reason:
       // "<<content<<"\n\n";
       writeLog(0,
-               "Artifact '" + x + "' generate ERROR! Reason: " + content + "\n",
+               "生成项 '" + x + "' 生成失败！原因：" + content + "\n",
                LOG_LEVEL_ERROR);
       if (sections.size() == 1)
         return -1;
@@ -2019,15 +2435,14 @@ int simpleGenerator() {
                      [](auto y) { return y.first == "Subscription-UserInfo"; });
     if (iter != response.headers.end())
       writeLog(0,
-               "User Info for artifact '" + x +
-                   "': " + subInfoToMessage(iter->second),
+               "生成项 '" + x + "' 的用户信息：" + subInfoToMessage(iter->second),
                LOG_LEVEL_INFO);
     // std::cerr<<"Artifact '"<<x<<"' generate SUCCESS!\n\n";
-    writeLog(0, "Artifact '" + x + "' generate SUCCESS!\n", LOG_LEVEL_INFO);
+    writeLog(0, "生成项 '" + x + "' 生成成功！\n", LOG_LEVEL_INFO);
     eraseElements(response.headers);
   }
   // std::cerr<<"All artifact generated. Exiting...\n";
-  writeLog(0, "All artifact generated. Exiting...", LOG_LEVEL_INFO);
+  writeLog(0, "所有生成项已生成，正在退出...", LOG_LEVEL_INFO);
   return 0;
 }
 
@@ -2036,17 +2451,24 @@ std::string renderTemplate(RESPONSE_CALLBACK_ARGS) {
   int *status_code = &response.status_code;
 
   std::string path = getUrlArg(argument, "path");
-  writeLog(0, "Trying to render template '" + path + "'...", LOG_LEVEL_INFO);
+  writeLog(0, "正在渲染模板：'" + path + "'。", LOG_LEVEL_INFO);
 
   if (!startsWith(path, global.templatePath) || !fileExist(path)) {
     *status_code = 404;
-    return "Not found";
+    return "Template not found or outside the allowed template directory.\n"
+           "未找到模板，或模板路径超出允许的模板目录。\n"
+           "Please provide a path under the configured template directory.\n"
+           "请提供位于已配置模板目录下的路径。";
   }
   std::string template_content =
       fetchFile(path, parseProxy(global.proxyConfig), global.cacheConfig);
   if (template_content.empty()) {
     *status_code = 400;
-    return "File empty or out of scope";
+    return "Invalid template: file is empty or cannot be read within the "
+           "allowed scope.\n"
+           "无效模板：文件为空，或无法在允许范围内读取。\n"
+           "Please check the template content and configured template path.\n"
+           "请检查模板内容和已配置的模板路径。";
   }
   template_args tpl_args;
   tpl_args.global_vars = global.templateVars;
@@ -2062,9 +2484,9 @@ std::string renderTemplate(RESPONSE_CALLBACK_ARGS) {
   if (render_template(template_content, tpl_args, output_content,
                       global.templatePath) != 0) {
     *status_code = 400;
-    writeLog(0, "Render failed with error.", LOG_LEVEL_WARNING);
+    writeLog(0, "渲染失败。", LOG_LEVEL_WARNING);
   } else
-    writeLog(0, "Render completed.", LOG_LEVEL_INFO);
+    writeLog(0, "渲染完成。", LOG_LEVEL_INFO);
 
   return output_content;
 }

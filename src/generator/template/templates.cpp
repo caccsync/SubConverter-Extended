@@ -12,6 +12,7 @@
 #include "utils/logger.h"
 #include "utils/network.h"
 #include "utils/regexp.h"
+#include "utils/time_compat.h"
 #include "utils/urlencode.h"
 #include "utils/yamlcpp_extra.h"
 #include "templates.h"
@@ -19,6 +20,8 @@
 // 在 ruleconvert.cpp 中定义的全局规则类型白名单
 extern string_array ClashRuleTypes;
 
+static thread_local FetchContext current_template_fetch_context =
+    FetchContext::TrustedConfig;
 
 namespace inja
 {
@@ -40,6 +43,69 @@ static inline void parse_json_pointer(nlohmann::json &json, const std::string &p
     {
         //ignore broken pointer
     }
+}
+
+static bool path_is_inside_scope(const std::filesystem::path &path,
+                                 const std::filesystem::path &scope)
+{
+    try
+    {
+        std::filesystem::path relative = std::filesystem::relative(path, scope);
+        std::string rel = relative.generic_string();
+        return rel == "." ||
+               (!relative.is_absolute() && rel != ".." &&
+                !startsWith(rel, "../"));
+    }
+    catch(std::exception &)
+    {
+        return false;
+    }
+}
+
+static std::string python_string_escape(const std::string &value)
+{
+    static const char hex[] = "0123456789abcdef";
+    std::string escaped;
+    escaped.reserve(value.size());
+    for(unsigned char c : value)
+    {
+        switch(c)
+        {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '"':
+            escaped += "\\\"";
+            break;
+        case '\'':
+            escaped += "\\'";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        default:
+            if(c < 0x20)
+            {
+                escaped += "\\x";
+                escaped += hex[c >> 4];
+                escaped += hex[c & 0x0f];
+            }
+            else
+                escaped += static_cast<char>(c);
+        }
+    }
+    return escaped;
+}
+
+static std::string python_string_literal(const std::string &value)
+{
+    return "\"" + python_string_escape(value) + "\"";
 }
 
 /*
@@ -77,13 +143,30 @@ std::string parseHostname(inja::Arguments &args)
 std::string template_webGet(inja::Arguments &args)
 {
     std::string data = args.at(0)->get<std::string>(), proxy = parseProxy(global.proxyConfig);
-    writeLog(0, "Template called fetch with url '" + data + "'.", LOG_LEVEL_INFO);
-    return webGet(data, proxy, global.cacheConfig);
+    writeLog(0, "模板调用 fetch，URL：'" + data + "'。", LOG_LEVEL_INFO);
+    return webGet(data, proxy, global.cacheConfig, nullptr, nullptr,
+                  current_template_fetch_context);
 }
 #endif // NO_WEBGET
 
-int render_template(const std::string &content, const template_args &vars, std::string &output, const std::string &include_scope)
+int render_template(const std::string &content, const template_args &vars,
+                    std::string &output, const std::string &include_scope,
+                    FetchContext context)
 {
+    struct TemplateFetchContextGuard
+    {
+        FetchContext previous;
+        explicit TemplateFetchContextGuard(FetchContext context)
+            : previous(current_template_fetch_context)
+        {
+            current_template_fetch_context = context;
+        }
+        ~TemplateFetchContextGuard()
+        {
+            current_template_fetch_context = previous;
+        }
+    } guard(context);
+
     std::string absolute_scope;
     try
     {
@@ -230,20 +313,22 @@ int render_template(const std::string &content, const template_args &vars, std::
 #endif // NO_WEBGET
     //env.add_callback("parseHostname", 1, parseHostname);
 
-    env.set_include_callback([&](const std::string &name, const std::string &template_name)
+    env.set_include_callback([&](const std::filesystem::path &path, const std::string &template_name)
     {
+        const std::string include_path = path.string();
         std::string absolute_path;
         try
         {
-            absolute_path = std::filesystem::canonical(template_name).string();
+            absolute_path = std::filesystem::canonical(path).string();
         }
         catch(std::exception &e)
         {
             throw inja::FileError(e.what());
         }
-        if(!absolute_scope.empty() && !startsWith(absolute_path, absolute_scope))
+        if(!absolute_scope.empty() &&
+           !path_is_inside_scope(absolute_path, absolute_scope))
             throw inja::FileError("access denied when trying to include '" + template_name + "': out of scope");
-        return env.parse(fileGet(template_name, true));
+        return env.parse(fileGet(include_path, true));
     });
     env.set_search_included_templates_in_files(false);
 
@@ -256,7 +341,7 @@ int render_template(const std::string &content, const template_args &vars, std::
     }
     catch (std::exception &e)
     {
-        output = "Template render failed! Reason: " + std::string(e.what());
+        output = "模板渲染失败。原因：" + std::string(e.what());
         writeLog(0, output, LOG_LEVEL_ERROR);
         return -1;
     }
@@ -345,7 +430,8 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                     vArray = split(strLine, ",");
                     if(vArray.size() < 2)
                         continue;
-                    geoips += "\"" + vArray[1] + "\": \"" + rule_group + "\",";
+                    geoips += python_string_literal(vArray[1]) + ": " +
+                              python_string_literal(rule_group) + ",";
                 }
                 continue;
             }
@@ -384,7 +470,6 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                 groups.emplace_back(rule_name);
                 continue;
             }
-            bool inline_expand = false;
             if(!remote_path_prefix.empty())
             {
                 if(fileExist(rule_path, true) || isLink(rule_path))
@@ -405,13 +490,6 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                         groups.emplace_back(rule_name);
                         continue;
                     }
-                    // 方案A：classic=false 时直接内联展开规则，不生成 rule-providers
-                    // 清除已注册的中间状态，避免后续 for(groups) 循环生成 rule-providers 条目
-                    urls.erase(rule_name);
-                    names.erase(rule_name);
-                    rule_type.erase(rule_name);
-                    ruleset_interval.erase(rule_name);
-                    inline_expand = true;
                 }
                 else
                     continue;
@@ -420,7 +498,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
             retrieved_rules = x.rule_content.get();
             if(retrieved_rules.empty())
             {
-                writeLog(0, "Failed to fetch ruleset or ruleset is empty: '" + x.rule_path + "'!", LOG_LEVEL_WARNING);
+                writeLog(0, "获取规则集失败或规则集为空：'" + x.rule_path + "'。", LOG_LEVEL_WARNING);
                 continue;
             }
 
@@ -439,27 +517,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                 if(!lineSize || strLine[0] == ';' || strLine[0] == '#' || (lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')) //empty lines and comments are ignored
                     continue;
 
-                if(inline_expand && !script)
-                {
-                    // 内联展开模式：与原版 rulesetToClashStr() 行为完全对齐
-                    // 步骤1：去首尾空白
-                    strLine = trimWhitespace(strLine, true, true);
-                    lineSize = strLine.size();
-                    if(!lineSize || strLine[0] == ';' || strLine[0] == '#' || (lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/'))
-                        continue;
-                    // 步骤2：过滤不支持的规则类型（ClashRuleTypes 白名单）
-                    if(std::none_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [&strLine](const std::string& type){ return startsWith(strLine, type); }))
-                        continue;
-                    // 步骤3：剥离行内 // 注释
-                    if(strFind(strLine, "//"))
-                    {
-                        strLine.erase(strLine.find("//"));
-                        strLine = trimWhitespace(strLine);
-                    }
-                    // 步骤4：追加策略组，保留 Mihomo 复合规则中带逗号的 payload
-                    rules.emplace_back(appendClashRuleTarget(strLine, rule_group));
-                }
-                else if(startsWith(strLine, "DOMAIN-KEYWORD,"))
+                if(startsWith(strLine, "DOMAIN-KEYWORD,"))
                 {
                     if(script)
                     {
@@ -467,9 +525,11 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                         if(vArray.size() < 2)
                             continue;
                         if(keywords.find(rule_name) == keywords.end())
-                            keywords[rule_name] = "\"" + trim(vArray[1]) + "\"";
+                            keywords[rule_name] =
+                                python_string_literal(trim(vArray[1]));
                         else
-                            keywords[rule_name] += ",\"" + trim(vArray[1]) + "\"";
+                            keywords[rule_name] += "," +
+                                                   python_string_literal(trim(vArray[1]));
                     }
                     else
                     {
@@ -496,23 +556,19 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                         has_no_resolve = true;
                 }
             }
-            // 内联展开模式下：规则已逐条写入 rules，无需生成 RULE-SET 引用，也不加入 groups
-            if(!inline_expand)
+            if(has_domain[rule_name] && !script)
+                rules.emplace_back("RULE-SET," + rule_name + " (Domain)," + rule_group);
+            if(has_ipcidr[rule_name] && !script)
             {
-                if(has_domain[rule_name] && !script)
-                    rules.emplace_back("RULE-SET," + rule_name + " (Domain)," + rule_group);
-                if(has_ipcidr[rule_name] && !script)
-                {
-                    if(has_no_resolve)
-                        rules.emplace_back("RULE-SET," + rule_name + " (IP-CIDR)," + rule_group + ",no-resolve");
-                    else
-                        rules.emplace_back("RULE-SET," + rule_name + " (IP-CIDR)," + rule_group);
-                }
-                if(!has_domain[rule_name] && !has_ipcidr[rule_name] && !script)
-                    rules.emplace_back("RULE-SET," + rule_name + "," + rule_group);
-                if(std::find(groups.begin(), groups.end(), rule_name) == groups.end())
-                    groups.emplace_back(rule_name);
+                if(has_no_resolve)
+                    rules.emplace_back("RULE-SET," + rule_name + " (IP-CIDR)," + rule_group + ",no-resolve");
+                else
+                    rules.emplace_back("RULE-SET," + rule_name + " (IP-CIDR)," + rule_group);
             }
+            if(!has_domain[rule_name] && !has_ipcidr[rule_name] && !script)
+                rules.emplace_back("RULE-SET," + rule_name + "," + rule_group);
+            if(std::find(groups.begin(), groups.end(), rule_name) == groups.end())
+                groups.emplace_back(rule_name);
         }
     }
     for(std::string &x : groups)
@@ -569,8 +625,8 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
             std::string json_path = "rules." + std::to_string(index) + ".";
             parse_json_pointer(data, json_path + "has_domain", group_has_domain ? "true" : "false");
             parse_json_pointer(data, json_path + "has_ipcidr", group_has_ipcidr ? "true" : "false");
-            parse_json_pointer(data, json_path + "name", x);
-            parse_json_pointer(data, json_path + "group", name);
+            parse_json_pointer(data, json_path + "name", python_string_escape(x));
+            parse_json_pointer(data, json_path + "group", python_string_escape(name));
             parse_json_pointer(data, json_path + "set", "true");
             parse_json_pointer(data, json_path + "keyword", keyword);
             parse_json_pointer(data, json_path + "original", (rule_type[x] == RULESET_CLASH_DOMAIN || rule_type[x] == RULESET_CLASH_IPCIDR) ? "true" : "false");
@@ -582,7 +638,8 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
         if(!geoips.empty())
             parse_json_pointer(data, "geoips", geoips.erase(geoips.size() - 1));
 
-        parse_json_pointer(data, "match_group", match_group);
+        parse_json_pointer(data, "match_group",
+                           python_string_escape(match_group));
 
         inja::Environment env;
         env.include_template("keyword_template", env.parse(clash_script_keyword_template));
@@ -596,7 +653,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
         }
         catch (std::exception &e)
         {
-            writeLog(0, "Error when rendering: " + std::string(e.what()), LOG_TYPE_ERROR);
+            writeLog(0, "渲染时发生错误：" + std::string(e.what()), LOG_TYPE_ERROR);
             return -1;
         }
     }

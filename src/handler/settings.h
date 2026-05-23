@@ -7,6 +7,7 @@
 #include "config/proxygroup.h"
 #include "config/regmatch.h"
 #include "config/ruleset.h"
+#include "handler/fetch_context.h"
 #include "generator/config/ruleconvert.h"
 #include "generator/template/templates.h"
 #include "utils/logger.h"
@@ -25,7 +26,8 @@ struct Settings {
   std::vector<RulesetContent> rulesetsContent;
   std::string listenAddress = "127.0.0.1", defaultUrls, insertUrls,
               managedConfigPrefix;
-  int listenPort = 25500, maxPendingConns = 10, maxConcurThreads = 4;
+  int listenPort = 25500, maxPendingConns = 10, maxConcurThreads = 16,
+      maxServerThreads = 128;
   bool prependInsert = true, skipFailedLinks = false;
   const bool APIMode = true; // Hardcoded for security - cannot be changed
   bool writeManagedConfig = false, enableRuleGen = true,
@@ -38,6 +40,11 @@ struct Settings {
   int logLevel = LOG_LEVEL_VERBOSE;
   long maxAllowedDownloadSize = 1048576L;
   string_map aliases;
+
+  // security profile: lan keeps legacy behavior, public restricts untrusted
+  // request fetches, strict additionally disables public upload overrides.
+  std::string securityProfile = "lan";
+  bool allowPublicUpload = false;
 
   // global variables for template
   std::string templatePath = "templates";
@@ -69,6 +76,11 @@ struct Settings {
   // cache system
   bool serveCacheOnFetchFail = false;
   int cacheSubscription = 60, cacheConfig = 300, cacheRuleset = 21600;
+
+  // request coalescing and short-lived response cache
+  bool enableRequestCoalescing = true, coalesceRetryOn5xx = true;
+  int responseCacheTtl = 0;
+  unsigned long long configGeneration = 0;
 
   // limits
   size_t maxAllowedRulesets = 64, maxAllowedRules = 32768;
@@ -104,8 +116,13 @@ struct ExternalConfig {
 
 extern Settings global;
 
-int importItems(string_array &target, bool scope_limit = true);
-int loadExternalConfig(std::string &path, ExternalConfig &ext);
+bool isPublicFetchRestricted(FetchContext context);
+bool isTrustedLocalResourcePath(const std::string &path);
+bool isPublicUploadAllowed();
+int importItems(string_array &target, bool scope_limit = true,
+                FetchContext context = FetchContext::TrustedConfig);
+int loadExternalConfig(std::string &path, ExternalConfig &ext,
+                       FetchContext context = FetchContext::TrustedConfig);
 // template <class T, class... U>
 // void find_if_exist(const toml::value &v, const toml::key &k, T& target,
 // U&&... args)

@@ -97,7 +97,7 @@ int serveFile(WebServer *server, const std::string &filename, std::string &conte
 
     return_data = fileGet(realname, false);
     content_type = checkMIMEType(realname);
-    writeLog(0, "file-server: serving '" + filename + "' type '" + content_type + "'", LOG_LEVEL_INFO);
+    writeLog(0, "文件服务：正在提供 '" + filename + "'，类型 '" + content_type + "'", LOG_LEVEL_INFO);
     return 0;
 }
 
@@ -114,7 +114,7 @@ static inline void buffer_cleanup(struct evbuffer *eb)
 
 static int process_request(WebServer *server, Request &request, Response &response, std::string &return_data)
 {
-    writeLog(0, "handle_cmd:    " + request.method + " handle_uri:    " + request.url, LOG_LEVEL_VERBOSE);
+    writeLog(0, "处理请求：method=" + request.method + " uri=" + request.url, LOG_LEVEL_VERBOSE);
 
     string_size pos = request.url.find('?');
     if(pos != std::string::npos)
@@ -151,14 +151,22 @@ static int process_request(WebServer *server, Request &request, Response &respon
             }
             catch(std::exception &e)
             {
-                return_data = "Internal server error while processing request path '" + request.url + "' with arguments '" + joinArguments(request.argument) + "'!";
-                return_data += "\n  exception: ";
+                return_data = "Internal server error while processing request.\n"
+                              "处理请求时发生内部服务器错误。\n"
+                              "Path / 路径: " + request.url + "\n"
+                              "Arguments / 参数: " + joinArguments(request.argument);
+                return_data += "\n  Exception / 异常: ";
                 return_data += type(e);
                 return_data += "\n  what(): ";
                 return_data += e.what();
                 response.content_type = "text/plain";
                 response.status_code = 500;
-                writeLog(0, return_data, LOG_LEVEL_ERROR);
+                writeLog(0,
+                         "处理请求时发生内部服务器错误。\n路径：" +
+                             request.url + "\n参数：" +
+                             joinArguments(request.argument) + "\n异常：" +
+                             type(e) + "\nwhat()：" + e.what(),
+                         LOG_LEVEL_ERROR);
             }
             return 0;
         }
@@ -198,11 +206,18 @@ static void on_request(evhttp_request *req, void *args)
     u_short client_port;
     evhttp_connection_get_peer(evhttp_request_get_connection(req), &client_ip, &client_port);
     //std::cerr<<"Accept connection from client "<<client_ip<<":"<<client_port<<"\n";
-    writeLog(0, "Accept connection from client " + std::string(client_ip) + ":" + std::to_string(client_port), LOG_LEVEL_DEBUG);
+    writeLog(0, "接受客户端连接：" + std::string(client_ip) + ":" + std::to_string(client_port), LOG_LEVEL_DEBUG);
 
     if (internal_flag != nullptr)
     {
-        evhttp_send_error(req, 500, "Loop request detected!");
+        auto buffer = evhttp_request_get_output_buffer(req);
+        std::string return_data = "Internal error: loop request detected.\n"
+                                  "内部错误：检测到循环请求。\n"
+                                  "Please check subscription URLs and proxy settings to avoid routing the service back to itself.\n"
+                                  "请检查订阅链接和代理设置，避免服务请求回到自身。";
+        evbuffer_add(buffer, return_data.data(), return_data.size());
+        evhttp_send_reply(req, 500, nullptr, buffer);
+        buffer_cleanup(buffer);
         return;
     }
 
@@ -213,7 +228,9 @@ static void on_request(evhttp_request *req, void *args)
         {
             evhttp_add_header(req->output_headers, "WWW-Authenticate", ("Basic realm=\"" + server->auth_realm + "\"").data());
             auto buffer = evhttp_request_get_output_buffer(req);
-            evbuffer_add_printf(buffer, "Unauthorized");
+            std::string return_data = "Unauthorized: missing or invalid credentials.\n"
+                                      "未授权：认证凭据缺失或无效。";
+            evbuffer_add(buffer, return_data.data(), return_data.size());
             evhttp_send_reply(req, 401, nullptr, buffer);
             buffer_cleanup(buffer);
             return;
@@ -290,7 +307,8 @@ static void on_request(evhttp_request *req, void *args)
         evhttp_send_reply(req, response.status_code, nullptr, output_buffer);
         break;
     case -1: //not found
-        return_data = "File not found.";
+        return_data = "File not found.\n"
+                      "未找到文件。";
         evbuffer_add(output_buffer, return_data.data(), return_data.size());
         evhttp_send_reply(req, HTTP_NOTFOUND, nullptr, output_buffer);
         //evhttp_send_error(req, HTTP_NOTFOUND, "Resource not found");
@@ -308,7 +326,7 @@ int WebServer::start_web_server(listener_args *args)
     if (!event_init())
     {
         //std::cerr << "Failed to init libevent." << std::endl;
-        writeLog(0, "Failed to init libevent.", LOG_LEVEL_FATAL);
+        writeLog(0, "初始化 libevent 失败。", LOG_LEVEL_FATAL);
         return -1;
     }
     const char *SrvAddress = listen_address.c_str();
@@ -317,7 +335,7 @@ int WebServer::start_web_server(listener_args *args)
     if (!server)
     {
         //std::cerr << "Failed to init http server." << std::endl;
-        writeLog(0, "Failed to init http server.", LOG_LEVEL_FATAL);
+        writeLog(0, "初始化 HTTP 服务失败。", LOG_LEVEL_FATAL);
         return -1;
     }
 
@@ -327,7 +345,7 @@ int WebServer::start_web_server(listener_args *args)
     if (event_dispatch() == -1)
     {
         //std::cerr << "Failed to run message loop." << std::endl;
-        writeLog(0, "Failed to run message loop.", LOG_LEVEL_FATAL);
+        writeLog(0, "运行消息循环失败。", LOG_LEVEL_FATAL);
         return -1;
     }
 
